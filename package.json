@@ -1,0 +1,62 @@
+{
+  "name": "paperclip-adapter-qoder",
+  "version": "0.1.0",
+  "description": "External Paperclip adapter that runs the local Qoder CLI (qoder_local)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kobe-yang/paperclip-adapter-qoder.git"
+  },
+  "homepage": "https://github.com/kobe-yang/paperclip-adapter-qoder",
+  "bugs": {
+    "url": "https://github.com/kobe-yang/paperclip-adapter-qoder/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./ui-parser": "./ui-parser.cjs"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "files": [
+    "dist",
+    "ui-parser.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && esbuild src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "npm run typecheck && npm run test && npm run build && node scripts/check-build.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run verify",
+    "pack:local": "node -e \"require('node:fs').mkdirSync('artifacts', { recursive: true })\" && npm pack --pack-destination ./artifacts"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-utils": "2026.1023.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "0.28.2",
+    "typescript": "^5.9.3",
+    "vitest": "4.1.12"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "keywords": [
+    "paperclip",
+    "paperclip-adapter",
+    "qoder",
+    "agent"
+  ]
+}

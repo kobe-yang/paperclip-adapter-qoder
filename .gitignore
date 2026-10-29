@@ -1,0 +1,11 @@
+node_modules/
+dist/
+artifacts/
+*.tgz
+
+# Local scratch; never commit captured runs or credentials.
+.testdrive/
+*.log
+.env
+.env.*
+.DS_Store
