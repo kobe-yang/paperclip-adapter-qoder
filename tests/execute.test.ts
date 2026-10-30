@@ -1,15 +1,18 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getEventListeners } from "node:events";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
   AdapterRuntimeEvent,
 } from "@paperclipai/adapter-utils/types";
+import { runningProcesses } from "@paperclipai/adapter-utils/server-utils";
 
 import { QODER_ADAPTER_TYPE, execute } from "../src/execute.js";
 
@@ -29,12 +32,45 @@ type Harness = {
 };
 
 let tmpRoot = "";
+let testHarnesses: Harness[] = [];
 
 beforeEach(() => {
+  testHarnesses = [];
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "qoder-adapter-exec-"));
 });
 
-afterEach(() => {
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function until(check: () => boolean, timeoutMs = 4_000): Promise<void> {
+  await vi.waitFor(() => expect(check()).toBe(true), { timeout: timeoutMs, interval: 20 });
+}
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const h of testHarnesses) {
+    for (const { pid } of h.spawns) {
+      if (process.platform !== "win32" && isAlive(-pid)) process.kill(-pid, "SIGKILL");
+      else if (isAlive(pid)) process.kill(pid, "SIGKILL");
+    }
+    const childFile = `${h.recordPath}.child`;
+    if (fs.existsSync(childFile)) {
+      const pid = Number(fs.readFileSync(childFile, "utf8"));
+      if (isAlive(pid)) process.kill(pid, "SIGKILL");
+      await until(() => !isAlive(pid));
+    }
+    for (const { pid } of h.spawns) {
+      await until(() => !isAlive(pid));
+      if (process.platform !== "win32") await until(() => !isAlive(-pid));
+    }
+  }
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
@@ -90,7 +126,7 @@ function harness(options: {
     runtimeTools: undefined,
   } as unknown as AdapterExecutionContext;
 
-  return {
+  const h = {
     ctx,
     logs,
     events,
@@ -105,7 +141,410 @@ function harness(options: {
         .join(""),
     readRecord: () => JSON.parse(fs.readFileSync(recordPath, "utf8")),
   };
+  testHarnesses.push(h);
+  return h;
 }
+
+describe("execute — signal cancellation scope", () => {
+  function cancellable(scenario = "hang", env: Record<string, string> = {}) {
+    const h = harness({ scenario, config: { timeoutSec: 2, graceSec: 0.1 }, env });
+    const controller = new AbortController();
+    h.ctx.signal = controller.signal;
+    h.ctx.onCancellationReady = vi.fn(async () => {});
+    return { h, controller };
+  }
+
+  it.each(["preabort", "ready-abort"])("spawns nothing on %s", async (phase) => {
+    const { h, controller } = cancellable("ok");
+    if (phase === "preabort") controller.abort();
+    h.ctx.onCancellationReady = vi.fn(async () => {
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+      controller.abort();
+      await Promise.resolve();
+    });
+    const result = await execute(h.ctx);
+    expect(h.ctx.onCancellationReady).toHaveBeenCalledOnce();
+    expect(h.spawns).toHaveLength(0);
+    expect(fs.existsSync(`${h.recordPath}.pid`)).toBe(false);
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect(result.signal).toBeNull();
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it.each(["hang", "ignore-term", "hang-with-stubborn-child"])(
+    "cancels %s using only the run signal and acknowledges after the owned group disappears",
+    async (scenario) => {
+      const { h, controller } = cancellable(
+        scenario === "ignore-term" ? "hang" : scenario,
+        scenario === "ignore-term" ? { FAKE_QODER_IGNORE_SIGTERM: "1" } : {},
+      );
+      const stopped = vi.fn(async () => {
+        expect(isAlive(-h.spawns[0]!.pid)).toBe(false);
+        if (fs.existsSync(`${h.recordPath}.child`)) {
+          expect(isAlive(Number(fs.readFileSync(`${h.recordPath}.child`, "utf8")))).toBe(false);
+        }
+      });
+      h.ctx.onProviderStopped = stopped;
+      const original = h.ctx.onLog;
+      h.ctx.onLog = async (stream, chunk) => {
+        await original(stream, chunk);
+        if (scenario === "hang-with-stubborn-child" ? chunk.includes('"subtype":"child"') : chunk.includes('"subtype":"init"')) {
+          controller.abort();
+        }
+      };
+      const result = await execute(h.ctx);
+      expect(result.timedOut).toBe(false);
+      expect(result.errorCode).toBe("qoder_cancelled");
+      expect(stopped).toHaveBeenCalledOnce();
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    },
+    10_000,
+  );
+
+  it("cancels through ctx.signal even when another SDK instance's host registry is empty", async () => {
+    const sdkPath = fileURLToPath(import.meta.resolve("@paperclipai/adapter-utils/server-utils"));
+    const hostSdk = await import(`${pathToFileURL(sdkPath).href}?isolated-host-sdk`);
+    expect(hostSdk.runningProcesses).not.toBe(runningProcesses);
+    const { h, controller } = cancellable("hang-with-stubborn-child");
+    const onLog = h.ctx.onLog;
+    h.ctx.onLog = async (stream, chunk) => {
+      await onLog(stream, chunk);
+      if (chunk.includes('"subtype":"child"')) {
+        expect(hostSdk.runningProcesses.has(h.ctx.runId)).toBe(false);
+        expect(runningProcesses.get(h.ctx.runId)?.child.pid).toBe(h.spawns[0]!.pid);
+        controller.abort();
+      }
+    };
+    const result = await execute(h.ctx);
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect(result.timedOut).toBe(false);
+    expect(isAlive(-h.spawns[0]!.pid)).toBe(false);
+    expect(hostSdk.runningProcesses.size).toBe(0);
+  });
+
+  it("reaps an ignoring, stdio-ignore descendant after normal parent exit before acknowledging", async () => {
+    const { h } = cancellable("parent-exit-with-child");
+    h.ctx.onProviderStopped = vi.fn(async () => {
+      expect(isAlive(Number(fs.readFileSync(`${h.recordPath}.child`, "utf8")))).toBe(false);
+      expect(isAlive(-h.spawns[0]!.pid)).toBe(false);
+    });
+    const result = await execute(h.ctx);
+    expect(result.errorCode).toBeNull();
+    expect(result.costUsd).toBe(0.002);
+    expect(h.ctx.onProviderStopped).toHaveBeenCalledOnce();
+    expect(isAlive(Number(fs.readFileSync(`${h.recordPath}.child`, "utf8")))).toBe(false);
+  });
+
+  it("destroys stdin on abort while the original onSpawn is still pending", async () => {
+    const { h, controller } = cancellable("ok");
+    let release!: () => void;
+    const delayed = new Promise<void>((resolve) => { release = resolve; });
+    const onSpawn = h.ctx.onSpawn;
+    let callbackFinished = false;
+    h.ctx.onSpawn = async (info) => {
+      await onSpawn?.(info);
+      await delayed;
+      callbackFinished = true;
+    };
+    const running = execute(h.ctx);
+    let returned = false;
+    void running.then(() => { returned = true; });
+    try {
+      await until(() => h.spawns.length === 1 && fs.existsSync(`${h.recordPath}.pid`));
+      controller.abort();
+      await until(() => !isAlive(h.spawns[0]!.pid));
+      await Promise.resolve();
+      expect(returned).toBe(false);
+      expect(fs.existsSync(`${h.recordPath}.stdin`)).toBe(false);
+    } finally {
+      release();
+      controller.abort();
+    }
+    const result = await running;
+    expect(callbackFinished).toBe(true);
+    expect(result.errorCode).toBe("qoder_cancelled");
+  });
+
+  it("retains terminal cost and protocol evidence but does not let a live provider mask user cancellation", async () => {
+    const { h, controller } = cancellable("linger-after-result");
+    const onEvent = h.ctx.onEvent;
+    h.ctx.onEvent = async (event) => {
+      await onEvent?.(event);
+      if (event.eventType === "result") controller.abort();
+    };
+    const result = await execute(h.ctx);
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect(result.costUsd).toBe(0.002);
+    expect(result.usage?.inputTokens).toBe(130);
+    expect(result.sessionId).toBe("fake-session-0001");
+    expect((result.resultJson as any).qoder.resultSubtype).toBe("success");
+    expect((result.resultJson as any).unmanagedBackgroundTask).toBeUndefined();
+  });
+
+  it("does not change success when abort arrives after all provider work stopped", async () => {
+    const { h, controller } = cancellable("ok");
+    h.ctx.onProviderStopped = async () => { controller.abort(); };
+    const result = await execute(h.ctx);
+    controller.abort();
+    expect(result.errorCode).toBeNull();
+    expect(result.summary).toBe("修复完成，测试通过。");
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it("waits for cancellation readiness even when aborted while readiness is pending", async () => {
+    const { h, controller } = cancellable("ok");
+    let release!: () => void;
+    h.ctx.onCancellationReady = () => new Promise<void>((resolve) => { release = resolve; });
+    const running = execute(h.ctx);
+    let returned = false;
+    void running.then(() => { returned = true; });
+    controller.abort();
+    await Promise.resolve();
+    expect(returned).toBe(false);
+    expect(h.meta).toHaveLength(0);
+    release();
+    expect((await running).errorCode).toBe("qoder_cancelled");
+    expect(h.spawns).toHaveLength(0);
+  });
+
+  it("removes the abort listener if readiness rejects", async () => {
+    const { h, controller } = cancellable("ok");
+    h.ctx.onCancellationReady = async () => { throw new Error("readiness failed"); };
+    await expect(execute(h.ctx)).rejects.toThrow("readiness failed");
+    expect(h.spawns).toHaveLength(0);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it("captures the SDK entry before invoking an onSpawn that synchronously aborts", async () => {
+    const { h, controller } = cancellable("ok");
+    const onSpawn = h.ctx.onSpawn;
+    h.ctx.onSpawn = async (info) => {
+      await onSpawn?.(info);
+      const child = runningProcesses.get(h.ctx.runId)!.child;
+      expect(child.pid).toBe(info.pid);
+      controller.abort();
+      expect(child.stdin?.destroyed).toBe(true);
+    };
+    const result = await execute(h.ctx);
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect(fs.existsSync(`${h.recordPath}.stdin`)).toBe(false);
+    expect(result.signal).toBe("SIGTERM");
+  });
+
+  it.each(["exit", "close"])("still cancels during leader %s if the owned descendant lives", async (phase) => {
+    const { h, controller } = cancellable("parent-exit-with-child");
+    const onSpawn = h.ctx.onSpawn;
+    h.ctx.onSpawn = async (info) => {
+      await onSpawn?.(info);
+      runningProcesses.get(h.ctx.runId)!.child.once(phase, () => { controller.abort(); });
+    };
+    const result = await execute(h.ctx);
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect(result.exitCode).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(result.costUsd).toBe(0.002);
+    expect(isAlive(-h.spawns[0]!.pid)).toBe(false);
+  });
+
+  it.each(["exit", "close"])("ignores a late %s abort when the whole owned group is gone", async (phase) => {
+    const { h, controller } = cancellable("ok");
+    const onSpawn = h.ctx.onSpawn;
+    h.ctx.onSpawn = async (info) => {
+      await onSpawn?.(info);
+      runningProcesses.get(h.ctx.runId)!.child.once(phase, () => { controller.abort(); });
+    };
+    const result = await execute(h.ctx);
+    expect(controller.signal.aborted).toBe(true);
+    expect(result.errorCode).toBeNull();
+    expect(result.summary).toBe("修复完成，测试通过。");
+  });
+
+  it.each(["timeout", "terminal-cleanup"])("reaps descendants despite leader close during %s", async (reason) => {
+    const { h } = cancellable(reason === "timeout" ? "hang-with-stubborn-child" : "linger-with-stubborn-child");
+    if (reason === "terminal-cleanup") h.ctx.config.timeoutSec = 15;
+    h.ctx.onProviderStopped = vi.fn(async () => {
+      expect(isAlive(-h.spawns[0]!.pid)).toBe(false);
+      expect(isAlive(Number(fs.readFileSync(`${h.recordPath}.child`, "utf8")))).toBe(false);
+    });
+    const result = await execute(h.ctx);
+    expect(h.ctx.onProviderStopped).toHaveBeenCalledOnce();
+    if (reason === "timeout") {
+      expect(result.errorCode).toBe("qoder_timeout");
+    } else {
+      expect(result.errorCode).toBeNull();
+      expect(result.signal).toBeNull();
+      expect((result.resultJson as any).unmanagedBackgroundTask).toMatchObject({ stopped: true, forceKilled: true });
+    }
+  }, 15_000);
+
+  it("user cancellation during actual terminal cleanup outranks its successful result", async () => {
+    const { h, controller } = cancellable("linger-after-result", { FAKE_QODER_IGNORE_SIGTERM: "1" });
+    h.ctx.config.timeoutSec = 15;
+    const original = h.ctx.onLog;
+    h.ctx.onLog = async (stream, chunk) => {
+      await original(stream, chunk);
+      if (chunk.includes("ignoring SIGTERM")) controller.abort();
+    };
+    const result = await execute(h.ctx);
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect(result.timedOut).toBe(false);
+    expect(result.costUsd).toBe(0.002);
+    expect((result.resultJson as any).unmanagedBackgroundTask).toMatchObject({ stopped: true, forceKilled: true });
+  }, 15_000);
+
+  it("keeps runtime timeout priority when a later user abort arrives during escalation", async () => {
+    const { h, controller } = cancellable("hang", { FAKE_QODER_IGNORE_SIGTERM: "1" });
+    h.ctx.config.timeoutSec = 0.2;
+    const onLog = h.ctx.onLog;
+    h.ctx.onLog = async (stream, chunk) => {
+      await onLog(stream, chunk);
+      if (chunk.includes("ignoring SIGTERM")) controller.abort();
+    };
+    const result = await execute(h.ctx);
+    expect(controller.signal.aborted).toBe(true);
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("qoder_timeout");
+    expect(isAlive(-h.spawns[0]!.pid)).toBe(false);
+  });
+
+  it("keeps concurrent runs isolated while the cancelled run escalates", async () => {
+    const first = cancellable("hang", { FAKE_QODER_IGNORE_SIGTERM: "1" });
+    const second = cancellable("hang");
+    second.h.ctx.runId = "run-isolation-2";
+    const firstRun = execute(first.h.ctx);
+    const secondRun = execute(second.h.ctx);
+    try {
+      await until(() => first.h.events.some((e) => e.eventType === "init") && second.h.events.some((e) => e.eventType === "init"));
+      first.controller.abort();
+      expect((await firstRun).errorCode).toBe("qoder_cancelled");
+      expect(isAlive(second.h.spawns[0]!.pid)).toBe(true);
+      expect(second.controller.signal.aborted).toBe(false);
+      second.controller.abort();
+      expect((await secondRun).errorCode).toBe("qoder_cancelled");
+    } finally {
+      first.controller.abort();
+      second.controller.abort();
+      await Promise.allSettled([firstRun, secondRun]);
+    }
+  });
+
+  it("settles the old group's escalation before a retry and never targets the new attempt", async () => {
+    const { h } = cancellable("session-missing-with-child");
+    h.ctx.runtime.sessionId = "stored-session";
+    const onSpawn = h.ctx.onSpawn;
+    h.ctx.onSpawn = async (info) => {
+      if (h.spawns.length === 1) expect(isAlive(-h.spawns[0]!.pid)).toBe(false);
+      await onSpawn?.(info);
+    };
+    h.ctx.onProviderStopped = vi.fn(async () => {
+      for (const { pid } of h.spawns) expect(isAlive(-pid)).toBe(false);
+    });
+    const result = await execute(h.ctx);
+    expect(h.spawns).toHaveLength(2);
+    expect(result.errorCode).toBeNull();
+    expect(result.summary).toBe("fresh session answer");
+    expect(h.ctx.onProviderStopped).toHaveBeenCalledOnce();
+  });
+
+  it.each(["retry-log", "retry-meta"])("forbids fresh spawn if cancellation lands in %s", async (phase) => {
+    const { h, controller } = cancellable("session-missing");
+    h.ctx.runtime.sessionId = "stored-session";
+    const onLog = h.ctx.onLog;
+    const onMeta = h.ctx.onMeta;
+    h.ctx.onLog = async (stream, chunk) => {
+      await onLog(stream, chunk);
+      if (phase === "retry-log" && chunk.includes("retrying once")) controller.abort();
+    };
+    h.ctx.onMeta = async (meta) => {
+      await onMeta?.(meta);
+      if (phase === "retry-meta" && h.meta.length === 2) controller.abort();
+    };
+    const result = await execute(h.ctx);
+    expect(h.spawns).toHaveLength(1);
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect(result.sessionId).toBe("stored-session");
+    expect((result.resultJson as any).qoder.resultSubtype).toBe("error_during_execution");
+  });
+
+  it("withholds collection and reports a bounded failure if owned-group absence cannot be verified", async () => {
+    const { h } = cancellable("parent-exit-with-child");
+    const kill = process.kill.bind(process);
+    vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (signal === 0 && pid === -(h.spawns[0]?.pid ?? 0)) {
+        throw Object.assign(new Error("probe denied"), { code: "EPERM" });
+      }
+      return kill(pid, signal);
+    });
+    h.ctx.onProviderStopped = vi.fn(async () => {});
+    const result = await execute(h.ctx);
+    expect(result.errorCode).toBe("qoder_provider_stop_unverified");
+    expect(result.costUsd).toBe(0.002);
+    expect((result.resultJson as any).qoderAdapter).toMatchObject({ providerStopVerified: false });
+    expect(h.ctx.onProviderStopped).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("fails within the stop deadline without acknowledging if the live helper cannot be stopped", async () => {
+    const { h, controller } = cancellable("linger-after-result");
+    const kill = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid === -(h.spawns[0]?.pid ?? 0) && signal !== 0) return true;
+      return kill(pid, signal);
+    });
+    h.ctx.onProviderStopped = vi.fn(async () => {});
+    const onEvent = h.ctx.onEvent;
+    h.ctx.onEvent = async (event) => {
+      await onEvent?.(event);
+      if (event.eventType === "result") controller.abort();
+    };
+    const started = Date.now();
+    const running = execute(h.ctx);
+    try {
+      const result = await running;
+      expect(Date.now() - started).toBeLessThan(9_000);
+      expect(result.errorCode).toBe("qoder_provider_stop_unverified");
+      expect(result.signal).toBeNull();
+      expect(result.costUsd).toBe(0.002);
+      expect(result.usageComplete).toBe(false);
+      expect((result.resultJson as any).qoderAdapter).toMatchObject({ providerStopVerified: false, helperSettled: false });
+      expect(isAlive(h.spawns[0]!.pid)).toBe(true);
+      expect(h.ctx.onProviderStopped).not.toHaveBeenCalled();
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    } finally {
+      killSpy.mockRestore();
+      for (const { pid } of h.spawns) if (isAlive(-pid)) kill(-pid, "SIGKILL");
+      await until(() => !runningProcesses.has(h.ctx.runId));
+      await Promise.allSettled([running]);
+    }
+    expect(h.ctx.onProviderStopped).not.toHaveBeenCalled();
+  }, 12_000);
+
+  it("clears its timers and listeners without subscribing to global OS signals", async () => {
+    const { h, controller } = cancellable("hang", { FAKE_QODER_IGNORE_SIGTERM: "1" });
+    const activeTimers = new Set<ReturnType<typeof setTimeout>>();
+    const set = globalThis.setTimeout;
+    const clear = globalThis.clearTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: any[]) => void, delay?: number, ...args: any[]) => {
+      const timer = set(() => { activeTimers.delete(timer); callback(...args); }, delay);
+      activeTimers.add(timer);
+      return timer;
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      activeTimers.delete(timer as ReturnType<typeof setTimeout>);
+      return clear(timer);
+    });
+    const signals = ["SIGTERM", "SIGINT"] as const;
+    const listeners = signals.map((signal) => getEventListeners(process, signal));
+    const onLog = h.ctx.onLog;
+    h.ctx.onLog = async (stream, chunk) => {
+      await onLog(stream, chunk);
+      if (chunk.includes('"subtype":"init"')) controller.abort();
+    };
+    await execute(h.ctx);
+    expect(activeTimers.size).toBe(0);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(signals.map((signal) => getEventListeners(process, signal))).toEqual(listeners);
+  });
+});
 
 describe("execute — successful run", () => {
   it("reports success, usage, cost and the session id", async () => {
@@ -339,6 +778,18 @@ describe("execute — failure classification", () => {
 });
 
 describe("execute — streaming robustness", () => {
+  it("preserves multilingual protocol and stderr at every UTF-8 byte boundary", async () => {
+    const h = harness({ scenario: "utf8-bytes" });
+    const result = await execute(h.ctx);
+    const text = "你好😀 / مرحبا / Привет / 체크리스트";
+    expect(result.errorCode).toBeNull();
+    expect(result.summary).toBe(text);
+    expect(h.logs.filter((entry) => entry.stream === "stderr").map((entry) => entry.chunk).join("")).toBe(text);
+    expect(h.stdoutText()).not.toContain("\uFFFD");
+    expect(result.resultJson).toMatchObject({ qoder: { decodeDamagedLines: 0, unparsedLines: 0 } });
+    expect(h.events.some((event) => JSON.stringify(event).includes(text))).toBe(true);
+  });
+
   it("reassembles the protocol when written three characters at a time", async () => {
     const h = harness({ scenario: "chunked" });
     const result = await execute(h.ctx);
@@ -550,11 +1001,13 @@ describe("execute — session continuity and isolation", () => {
       scenario: "session-missing-hang",
       runtime: { sessionId: "stored-session" },
     });
+    const controller = new AbortController();
+    h.ctx.signal = controller.signal;
     const onLog = h.ctx.onLog;
     h.ctx.onLog = async (stream, chunk) => {
       await onLog(stream, chunk);
       if (stream === "stderr" && chunk.includes("session stored-session not found")) {
-        process.kill(h.spawns[0]!.pid, "SIGTERM");
+        controller.abort();
       }
     };
     const result = await execute(h.ctx);
@@ -584,7 +1037,7 @@ describe("execute — session continuity and isolation", () => {
 
   it("does not retry after a host abort even with a pre-init missing-session error", async () => {
     const h = harness({
-      scenario: "session-missing",
+      scenario: "session-missing-hang-result",
       runtime: { sessionId: "stored-session" },
     });
     const controller = new AbortController();
@@ -600,9 +1053,10 @@ describe("execute — session continuity and isolation", () => {
     expect(h.spawns).toHaveLength(1);
     expect(h.readRecord().resumeSessionId).toBe("stored-session");
     expect(h.stdoutText()).not.toContain("retrying once");
-    expect(result.exitCode).toBe(1);
-    expect(result.signal).toBeNull();
-    expect(result.errorCode).toBe("qoder_session_unrecoverable");
+    expect(result.exitCode).toBeNull();
+    expect(result.signal).toBe("SIGTERM");
+    expect(result.errorCode).toBe("qoder_cancelled");
+    expect((result.resultJson as any).qoder.resultSubtype).toBe("error_during_execution");
   });
 
   it.each(["init", "tool-call", "tool-result"])(

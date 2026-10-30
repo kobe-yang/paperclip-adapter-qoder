@@ -100,6 +100,37 @@ function resultLine(overrides) {
   };
 }
 
+async function spawnStubbornChild() {
+  const { spawn } = await import("node:child_process");
+  const readyPath = `${recordPath}.child`;
+  const child = spawn(process.execPath, ["-e", `
+    process.on("SIGTERM", () => {});
+    require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));
+    setInterval(() => {}, 1000);
+  `], { stdio: "ignore" });
+  const deadline = Date.now() + 2_000;
+  await new Promise((resolve, reject) => {
+    const timer = setInterval(() => {
+      if (fs.existsSync(readyPath)) {
+        clearInterval(timer);
+        resolve();
+      } else if (Date.now() >= deadline || child.exitCode !== null || child.signalCode !== null) {
+        clearInterval(timer);
+        child.kill("SIGKILL");
+        reject(new Error("fake descendant did not become ready"));
+      }
+    }, 10);
+  });
+  return child;
+}
+
+if (process.env.FAKE_QODER_IGNORE_SIGTERM === "1") {
+  process.on("SIGTERM", () => { process.stderr.write("ignoring SIGTERM\n"); });
+}
+if (recordPath) fs.writeFileSync(`${recordPath}.pid`, String(process.pid));
+process.stdin.on("data", (chunk) => {
+  if (recordPath) fs.appendFileSync(`${recordPath}.stdin`, chunk);
+});
 const stdin = await readStdin();
 
 if (recordPath) {
@@ -214,6 +245,8 @@ switch (scenario) {
   }
 
   case "session-missing":
+  case "session-missing-with-child":
+  case "session-missing-hang-result":
   case "session-missing-exit0-error":
   case "session-missing-stderr":
   case "session-missing-hang":
@@ -224,6 +257,7 @@ switch (scenario) {
     // Only fails when a resume was requested, so the adapter's one retry with a
     // fresh session can succeed.
     if (flagValue("-r")) {
+      if (scenario === "session-missing-with-child") await spawnStubbornChild();
       if (scenario === "session-missing-after-init") write(initLine());
       if (scenario === "session-missing-after-tool-call" || scenario === "session-missing-after-tool-result") {
         if (scenario === "session-missing-after-tool-call") {
@@ -260,7 +294,14 @@ switch (scenario) {
         session_id: flagValue("-r"),
         terminal_reason: "completed",
       });
+      if (scenario === "session-missing-hang-result") {
+        setInterval(() => {}, 1000);
+        break;
+      }
       process.exit(scenario === "session-missing-exit0-error" ? 0 : 1);
+    }
+    if (scenario === "session-missing-with-child") {
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
     write(initLine());
     write(assistantText("fresh session answer"));
@@ -295,14 +336,28 @@ switch (scenario) {
     break;
   }
 
+  case "utf8-bytes": {
+    const text = "你好😀 / مرحبا / Привет / 체크리스트";
+    const payload = Buffer.from(
+      `${JSON.stringify(initLine())}\n` +
+      `${JSON.stringify(assistantText(text))}\n` +
+      `${JSON.stringify(resultLine({ result: text }))}\n`,
+      "utf8",
+    );
+    const stderr = Buffer.from(text, "utf8");
+    const { setTimeout: delay } = await import("node:timers/promises");
+    for (let at = 0; at < payload.length; at += 1) {
+      process.stdout.write(payload.subarray(at, at + 1));
+      if (at < stderr.length) process.stderr.write(stderr.subarray(at, at + 1));
+      await delay(1);
+    }
+    process.exit(0);
+    break;
+  }
+
   // Never exits on its own: used for timeout and cancellation.
   case "hang": {
     write(initLine());
-    if (process.env.FAKE_QODER_IGNORE_SIGTERM === "1") {
-      process.on("SIGTERM", () => {
-        process.stderr.write("ignoring SIGTERM\n");
-      });
-    }
     setInterval(() => {}, 1000);
     break;
   }
@@ -315,6 +370,18 @@ switch (scenario) {
       stdio: "ignore",
     });
     process.stdout.write(`${JSON.stringify({ type: "system", subtype: "child", pid: child.pid })}\n`);
+    setInterval(() => {}, 1000);
+    break;
+  }
+
+  case "hang-with-stubborn-child":
+  case "parent-exit-with-child":
+  case "linger-with-stubborn-child": {
+    const child = await spawnStubbornChild();
+    write(initLine());
+    write({ type: "system", subtype: "child", pid: child.pid });
+    if (scenario !== "hang-with-stubborn-child") write(resultLine({ result: "parent answered" }));
+    if (scenario === "parent-exit-with-child") process.exit(0);
     setInterval(() => {}, 1000);
     break;
   }

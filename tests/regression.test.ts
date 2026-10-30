@@ -26,6 +26,14 @@ import {
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const RECORDED = fs.readFileSync(path.join(fixturesDir, "successful-run-recorded.jsonl"), "utf8");
+const parserSource = fs.readFileSync(path.join(fixturesDir, "../../ui-parser.cjs"), "utf8");
+const parserModule = { exports: {} };
+const browserParse = new Function("module", "exports", "require", `${parserSource}\nreturn module.exports;`)(
+  parserModule,
+  parserModule.exports,
+  () => { throw new Error("ui-parser must not call require()"); },
+).parseStdoutLine as (line: string, ts: string) => Record<string, any>[];
+const TS = "2026-10-29T12:00:00.000Z";
 
 /** Replays recorded stdout through the splitter, as the host delivers it. */
 function replay(raw: string, chunkSize = raw.length): QoderStreamAggregator {
@@ -110,6 +118,29 @@ describe("recorded successful run", () => {
     expect(result.costStatus).toBe("unpriced");
     expect(result.costUsd).toBeNull();
     expect(result.billingType).toBe("credits");
+  });
+
+  it("shows the recorded credits receipt as unpriced in both server and browser", () => {
+    const { state } = replay(RECORDED);
+    const result = resultFor(state, STOPPED_AFTER_RESULT);
+    const entries = RECORDED.split("\n").flatMap((line) => browserParse(line, TS));
+    expect(entries.some((entry) => entry.kind === "result")).toBe(false);
+    const receipt = entries.find((entry) => entry.family === "terminal" && entry.eventType === "result");
+    expect(state.totalCredits).toBe(11.62484788);
+    expect(receipt).toMatchObject({
+      kind: "provider_activity", ts: TS, status: "completed", summary: state.resultText,
+      payload: {
+        subtype: "success", isError: false, errors: [],
+        usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0 },
+        totalCredits: state.totalCredits, costUsd: null, costStatus: "unpriced",
+      },
+    });
+    expect(receipt?.title).toContain("USD cost unavailable");
+    expect(receipt?.title).toContain("Qoder credits");
+    expect(receipt?.title).toContain(String(state.totalCredits));
+    expect(receipt?.payload.costUsd).toBe(result.costUsd);
+    expect(receipt?.payload.costStatus).toBe(result.costStatus);
+    expect(receipt).not.toHaveProperty("costUsd");
   });
 
   it("reports zero-token usage as zeros, not as missing", () => {
@@ -282,6 +313,37 @@ describe("cost decision table", () => {
     inputTokens: input,
     outputTokens: output,
     cachedInputTokens: cached,
+  });
+
+  it.each([
+    { name: "credits with zero USD and tokens", fields: { total_cost_usd: 0, total_credits: 3.931968, usage: { input_tokens: 0, output_tokens: 0 } }, priced: false },
+    { name: "credits and tokens with zero USD", fields: { total_cost_usd: 0, total_credits: 3.931968, usage: { input_tokens: 10 } }, priced: false },
+    { name: "missing USD and usage", fields: {}, priced: false },
+    { name: "missing USD with zero usage", fields: { usage: { input_tokens: 0, output_tokens: 0 } }, priced: false },
+    { name: "tokens with zero USD", fields: { total_cost_usd: 0, usage: { input_tokens: 10 } }, priced: false },
+    { name: "cache reads with zero USD", fields: { total_cost_usd: 0, usage: { cache_read_input_tokens: 10 } }, priced: false },
+    { name: "cache writes with zero USD", fields: { total_cost_usd: 0, usage: { cache_creation_input_tokens: 10 } }, priced: false },
+    { name: "positive USD with credits", fields: { total_cost_usd: 0.25, total_credits: 3.931968, usage: { input_tokens: 10 } }, priced: true },
+    { name: "explicit zero consumption", fields: { total_cost_usd: 0, total_credits: 0, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }, priced: true },
+    { name: "explicit zero USD without usage", fields: { total_cost_usd: 0 }, priced: true },
+  ])("keeps server and browser pricing consistent: $name", ({ fields, priced }) => {
+    const line = JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "done", ...fields });
+    const result = resultFor(replay(line).state, STOPPED_AFTER_RESULT);
+    const entries = browserParse(line, TS);
+    expect(result.costStatus).toBe(priced ? "reported" : "unpriced");
+    expect(entries).toHaveLength(1);
+    if (priced) {
+      expect(entries[0]?.kind).toBe("result");
+      expect(entries[0]?.costUsd).toBe(result.costUsd);
+      expect(typeof entries[0]?.costUsd).toBe("number");
+      expect(Number.isFinite(entries[0]?.costUsd)).toBe(true);
+    } else {
+      expect(entries[0]).toMatchObject({
+        kind: "provider_activity", family: "terminal", eventType: "result",
+        payload: { costUsd: result.costUsd, costStatus: result.costStatus },
+      });
+      expect(entries.some((entry) => entry.kind === "result")).toBe(false);
+    }
   });
 
   it("reports a positive USD cost as given", () => {

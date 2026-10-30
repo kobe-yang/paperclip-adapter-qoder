@@ -20,6 +20,7 @@
  *    environment, which this adapter does not do.
  */
 
+import type { ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -38,6 +39,8 @@ import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provid
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+  UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   asNumber,
   asString,
   buildInvocationEnvForLogs,
@@ -54,8 +57,11 @@ import {
   readPaperclipIssueWorkModeFromContext,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
+  runningProcesses,
   selectInitialCommunicationGuidance,
   selectPaperclipPromptSections,
+  signalRunningProcess,
+  type TerminalResultCleanupEvidence,
 } from "@paperclipai/adapter-utils/server-utils";
 import type {
   AdapterExecutionContext,
@@ -95,19 +101,298 @@ const STDERR_SCAN_CHARS = 8_000;
 const TERMINAL_RESULT_GRACE_MS = 5_000;
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const cancellation = createCancellationScope(ctx.signal);
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   try {
-    return await runQoder(ctx, providerStop);
+    await ctx.onCancellationReady?.();
+    if (!cancellation.prepareAttempt()) return cancelledBeforeSpawn(ctx);
+    return await runQoder(ctx, providerStop, cancellation);
   } finally {
-    await providerStop.collectBeforeRestore();
+    try {
+      await cancellation.dispose();
+    } finally {
+      await providerStop.collectBeforeRestore();
+    }
   }
 }
 
 type ProviderStopBoundary = ReturnType<typeof createProviderStoppedBoundary>;
+type CancellationScope = ReturnType<typeof createCancellationScope>;
+type ProcessResult = Awaited<ReturnType<typeof runAdapterExecutionTargetProcess>>;
+type SpawnInfo = Parameters<NonNullable<AdapterExecutionContext["onSpawn"]>>[0];
+
+function cancelledBeforeSpawn(ctx: AdapterExecutionContext): AdapterExecutionResult {
+  const stored = readStoredSession(ctx.runtime.sessionParams, ctx.runtime.sessionId);
+  return buildExecutionResult({
+    state: new QoderStreamAggregator().state,
+    proc: { exitCode: null, signal: null, timedOut: false },
+    configuredModel: asString(ctx.config.model, ""),
+    attemptedResume: false,
+    sessionParams: ctx.runtime.sessionParams ?? null,
+    resolvedSessionId: stored?.sessionId ?? null,
+    clearSession: false,
+    timeoutMessage: "",
+    cancelled: true,
+  });
+}
+
+function createCancellationScope(signal: AbortSignal | undefined) {
+  let cancelled = false;
+  let preparing = true;
+  let disposed = false;
+  let active: OwnedInvocation | null = null;
+  const invocations: OwnedInvocation[] = [];
+  const abort = () => {
+    if (disposed || (!preparing && !active) || active?.isStopped()) return;
+    cancelled = true;
+    active?.stop();
+  };
+  signal?.addEventListener("abort", abort);
+  return {
+    get cancelled() { return cancelled; },
+    prepareAttempt() {
+      preparing = true;
+      if (signal?.aborted) abort();
+      return !cancelled;
+    },
+    own(invocation: OwnedInvocation) {
+      active = invocation;
+      preparing = false;
+      invocations.push(invocation);
+      if (signal?.aborted) abort();
+    },
+    finish(invocation: OwnedInvocation) {
+      if (active === invocation) {
+        active = null;
+        preparing = false;
+      }
+    },
+    async dispose() {
+      try {
+        await Promise.all(invocations.map((invocation) => invocation.settle()));
+      } finally {
+        disposed = true;
+        signal?.removeEventListener("abort", abort);
+      }
+    },
+  };
+}
+
+class OwnedInvocation {
+  private owned: { pid: number; processGroupId: number | null; startedAt: string; child: ChildProcess | null } | null = null;
+  private stopRequested = false;
+  private stopPromise: Promise<void> | null = null;
+  private helperSettlement: Promise<void> = Promise.resolve();
+  private resolveStopFailure!: () => void;
+  private stopFailure = new Promise<void>((resolve) => { this.resolveStopFailure = resolve; });
+  private spawnSettlements: Promise<void>[] = [];
+  private settlement: Promise<void> | null = null;
+  helperSettled = false;
+  private timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  private terminalTimer: ReturnType<typeof setTimeout> | null = null;
+  private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private verified = false;
+  private escalated = false;
+  private probeError: string | null = null;
+  timedOut = false;
+  stopError: string | null = null;
+  private cleanup: (Omit<TerminalResultCleanupEvidence, "stopped"> & { stopped: boolean }) | null = null;
+
+  get terminalResultCleanup(): TerminalResultCleanupEvidence | null {
+    return this.cleanup?.stopped ? { ...this.cleanup, stopped: true } : null;
+  }
+
+  constructor(
+    private runId: string,
+    private graceSec: number,
+    private timeoutSec: number,
+    private confirmStopped: () => void,
+  ) {}
+
+  private groupGone(): boolean {
+    if (this.verified) return true;
+    const owned = this.owned;
+    if (!owned) return false;
+    if (process.platform === "win32" || !owned.processGroupId) {
+      this.probeError = "No owned POSIX process group is available; descendant termination is unverified.";
+      return false;
+    }
+    try {
+      process.kill(-owned.processGroupId, 0);
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        this.verified = true;
+        return true;
+      }
+      this.probeError = `Owned process group ${owned.processGroupId} liveness check failed: ${errorText(error)}`;
+      return false;
+    }
+  }
+
+  isStopped(): boolean {
+    return this.verified || this.groupGone();
+  }
+
+  async capture(info: SpawnInfo): Promise<void> {
+    // The SDK publishes its entry only after calling onSpawn, before this microtask resumes.
+    await Promise.resolve();
+    const entry = runningProcesses.get(this.runId);
+    const child = entry?.child.pid === info.pid && entry.processGroupId === info.processGroupId
+      ? entry.child : null;
+    child?.stdout?.setEncoding("utf8");
+    child?.stderr?.setEncoding("utf8");
+    this.owned = {
+      pid: info.pid,
+      processGroupId: info.processGroupId === info.pid && info.pid > 0 ? info.pid : null,
+      startedAt: info.startedAt,
+      child,
+    };
+    child?.once("exit", this.stopOnExit);
+    child?.once("close", this.stopOnExit);
+    child?.once("error", this.stopOnExit);
+    if (this.stopRequested) {
+      this.stop();
+    } else if (!child || child.exitCode !== null || child.signalCode !== null) {
+      this.stop();
+    } else if (this.timeoutSec > 0) {
+      this.timeoutTimer = setTimeout(() => {
+        if (this.isStopped()) return;
+        this.timedOut = true;
+        this.stop();
+      }, this.timeoutSec * 1000);
+    }
+    if (!child) await this.stopPromise;
+  }
+
+  trackSpawn(callback: Promise<void>): void {
+    this.spawnSettlements.push(callback.then(() => {}, () => {}));
+  }
+
+  trackHelper(helper: Promise<ProcessResult>): void {
+    const settled = () => { this.helperSettled = true; this.stop(); };
+    this.helperSettlement = helper.then(settled, settled);
+  }
+
+  waitForHelper(helper: Promise<ProcessResult>): Promise<ProcessResult | null> {
+    return Promise.race([helper, this.stopFailure.then(() => null)]);
+  }
+
+  unverifiedSnapshot(stdout: string, stderr: string): ProcessResult {
+    return {
+      exitCode: this.owned?.child?.exitCode ?? null,
+      signal: this.owned?.child?.signalCode ?? null,
+      timedOut: this.timedOut,
+      errorCode: "qoder_provider_stop_unverified",
+      stdout,
+      stderr,
+      pid: this.owned?.pid ?? null,
+      startedAt: this.owned?.startedAt ?? null,
+    };
+  }
+
+  noteTerminalResult(): void {
+    if (this.stopRequested || this.terminalTimer || this.isStopped()) return;
+    this.terminalTimer = setTimeout(() => {
+      this.terminalTimer = null;
+      if (this.stopRequested || this.isStopped()) return;
+      this.cleanup = {
+        kind: "terminal_result_cleanup",
+        stopped: false,
+        stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
+        reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
+        terminalResultSeen: true,
+        signal: "SIGTERM",
+        forceKilled: false,
+      };
+      this.stop();
+    }, TERMINAL_RESULT_GRACE_MS);
+  }
+
+  private stopOnExit = (): void => { this.stop(); };
+
+  private clearWorkTimers(): void {
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    if (this.terminalTimer) clearTimeout(this.terminalTimer);
+    this.timeoutTimer = null;
+    this.terminalTimer = null;
+  }
+
+  private send(signal: NodeJS.Signals): void {
+    const owned = this.owned;
+    if (!owned || this.groupGone()) return;
+    try {
+      if (owned.child) signalRunningProcess({ child: owned.child, processGroupId: owned.processGroupId }, signal);
+      else if (process.platform !== "win32" && owned.processGroupId) process.kill(-owned.processGroupId, signal);
+    } catch (error) {
+      this.probeError = `Owned provider signal ${signal} failed: ${errorText(error)}`;
+    }
+  }
+
+  stop(): void {
+    this.stopRequested = true;
+    this.owned?.child?.stdin?.destroy();
+    this.clearWorkTimers();
+    if (!this.owned || this.stopPromise) return;
+    const graceMs = Math.max(0, Number.isFinite(this.graceSec) ? this.graceSec : DEFAULT_GRACE_SEC) * 1000;
+    const killAt = Date.now() + graceMs;
+    const deadline = killAt + 5_000;
+    this.send("SIGTERM");
+    this.stopPromise = new Promise<void>((resolve) => {
+      const probe = () => {
+        this.pollTimer = null;
+        if (this.groupGone()) {
+          this.verified = true;
+          if (this.cleanup) this.cleanup.stopped = true;
+          resolve();
+          return;
+        }
+        if (!this.escalated && Date.now() >= killAt) {
+          this.escalated = true;
+          if (this.cleanup) {
+            this.cleanup.signal = "SIGKILL";
+            this.cleanup.forceKilled = true;
+          }
+          this.send("SIGKILL");
+        }
+        if (Date.now() >= deadline) {
+          this.stopError = this.probeError ?? `Owned process group ${this.owned?.processGroupId} still exists after SIGKILL; provider stop is unverified.`;
+          this.resolveStopFailure();
+          resolve();
+          return;
+        }
+        this.pollTimer = setTimeout(probe, 20);
+      };
+      probe();
+    });
+  }
+
+  settle(): Promise<void> {
+    this.settlement ??= (async () => {
+      try {
+        await Promise.race([this.helperSettlement, this.stopFailure]);
+        await Promise.race([Promise.all(this.spawnSettlements), this.stopFailure]);
+        this.stop();
+        await this.stopPromise;
+        if (!this.owned) this.stopError = "No owned child metadata was captured; provider termination is unverified.";
+        if (this.verified && this.helperSettled) this.confirmStopped();
+      } finally {
+        this.clearWorkTimers();
+        if (this.pollTimer) clearTimeout(this.pollTimer);
+        this.pollTimer = null;
+        this.owned?.child?.removeListener("exit", this.stopOnExit);
+        this.owned?.child?.removeListener("close", this.stopOnExit);
+        this.owned?.child?.removeListener("error", this.stopOnExit);
+      }
+    })();
+    return this.settlement;
+  }
+}
 
 async function runQoder(
   ctx: AdapterExecutionContext,
   providerStop: ProviderStopBoundary,
+  cancellation: CancellationScope,
 ): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } =
     ctx;
@@ -314,9 +599,12 @@ async function runQoder(
     aggregator: QoderStreamAggregator;
     droppedOutputLines: number;
     nonResultOutputSeen: boolean;
+    stopError: string | null;
+    helperSettled: boolean;
   };
 
-  const runAttempt = async (resumeSessionId: string | null): Promise<Attempt> => {
+  const runAttempt = async (resumeSessionId: string | null): Promise<Attempt | null> => {
+    if (!cancellation.prepareAttempt()) return null;
     const resumedSession = Boolean(resumeSessionId);
     await hydrateFreshSessionHandoff(ctx, { resumedSession });
     const sections = selectPaperclipPromptSections(context, {
@@ -382,11 +670,18 @@ async function runQoder(
       });
     }
 
+    if (!cancellation.prepareAttempt()) return null;
+    const invocation = new OwnedInvocation(runId, graceSec, timeout.timeoutSec, providerStop.beginInvocation());
+    cancellation.own(invocation);
     const aggregator = new QoderStreamAggregator();
     const splitter = new LineSplitter();
+    let acceptingOutput = true;
+    let stdoutTail = "";
+    let stderrTail = "";
     let nonResultOutputSeen = false;
     const emitLine = async (line: string): Promise<void> => {
       const events = aggregator.ingestLine(line);
+      if (aggregator.state.resultSeen) invocation.noteTerminalResult();
       if (line.trim() && (events.length === 0 || events.some((event) => event.eventType !== "result"))) {
         nonResultOutputSeen = true;
       }
@@ -395,27 +690,49 @@ async function runQoder(
       }
     };
 
-    const proc = await runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
-      onProcessStopped: providerStop.beginInvocation(),
+    const helper = runAdapterExecutionTargetProcess(runId, executionTarget, command, args, {
       cwd,
       env: childEnv,
       stdin: buildQoderStdinPayload(prompt),
-      timeoutSec: timeout.timeoutSec,
+      timeoutSec: 0,
       graceSec,
-      onSpawn,
+      onSpawn: (info) => {
+        const callback = (async () => {
+          await invocation.capture(info);
+          await onSpawn?.(info);
+        })();
+        invocation.trackSpawn(callback);
+        return callback;
+      },
       onRuntimeProgress: ctx.onRuntimeProgress,
       onLog: async (stream, chunk) => {
+        if (!acceptingOutput) return;
+        if (stream === "stdout") stdoutTail = tail(stdoutTail + chunk) ?? "";
+        else stderrTail = tail(stderrTail + chunk) ?? "";
         await onLog(stream, chunk);
-        if (stream !== "stdout") return;
-        for (const line of splitter.push(chunk)) await emitLine(line);
-      },
-      // The CLI can own background tasks that outlive its answer. Once the
-      // terminal result is in, a still-running child only holds the run open.
-      terminalResultCleanup: {
-        hasTerminalResult: () => aggregator.state.resultSeen,
-        graceMs: TERMINAL_RESULT_GRACE_MS,
+        if (!acceptingOutput || stream !== "stdout") return;
+        for (const line of splitter.push(chunk)) {
+          if (!acceptingOutput) return;
+          await emitLine(line);
+        }
       },
     });
+    invocation.trackHelper(helper);
+    let proc: ProcessResult;
+    try {
+      const result = await invocation.waitForHelper(helper);
+      proc = result ?? invocation.unverifiedSnapshot(stdoutTail, stderrTail);
+    } finally {
+      await invocation.settle();
+      acceptingOutput = false;
+      cancellation.finish(invocation);
+    }
+    proc = {
+      ...proc,
+      timedOut: invocation.timedOut,
+      errorCode: invocation.stopError ? "qoder_provider_stop_unverified" : proc.errorCode,
+      terminalResultCleanup: invocation.terminalResultCleanup,
+    };
     for (const line of splitter.flush()) await emitLine(line);
 
     if (aggregator.state.decodeDamagedLines > 0) {
@@ -435,7 +752,14 @@ async function runQoder(
       );
     }
 
-    return { proc, aggregator, droppedOutputLines: splitter.droppedLineCount, nonResultOutputSeen };
+    return {
+      proc,
+      aggregator,
+      droppedOutputLines: splitter.droppedLineCount,
+      nonResultOutputSeen,
+      stopError: invocation.stopError,
+      helperSettled: invocation.helperSettled,
+    };
   };
 
   const toResult = (
@@ -470,8 +794,13 @@ async function runQoder(
       resolvedSessionId,
       clearSession: options.clearSessionOnMissingSession && !resolvedSessionId,
       timeoutMessage: formatAdapterExecutionTimeoutErrorMessage(timeout),
+      cancelled: cancellation.cancelled,
       diagnostics: {
         qoderAdapter: {
+          cancelled: cancellation.cancelled,
+          providerStopVerified: !attempt.stopError,
+          providerStopError: attempt.stopError,
+          helperSettled: attempt.helperSettled,
           permissionMode: permission.mode,
           permissionModeWarning: permission.warning,
           resumeRefusal: resumeDecision.refusalReason,
@@ -485,6 +814,7 @@ async function runQoder(
   };
 
   const first = await runAttempt(resumeDecision.resumeSessionId);
+  if (!first) return cancelledBeforeSpawn(ctx);
   const firstState = first.aggregator.state;
   const resumeFailed = firstState.resultSeen
     ? firstState.resultIsError
@@ -498,6 +828,7 @@ async function runQoder(
     !first.proc.signal &&
     !first.proc.errorCode &&
     !firstState.aborted &&
+    !cancellation.cancelled &&
     !ctx.signal?.aborted &&
     isSessionUnrecoverable(
       normalizeHaystack(
@@ -513,7 +844,7 @@ async function runQoder(
         `retrying once with a fresh session.\n`,
     );
     const retry = await runAttempt(null);
-    return toResult(retry, { attemptedResume: false, clearSessionOnMissingSession: true });
+    if (retry) return toResult(retry, { attemptedResume: false, clearSessionOnMissingSession: true });
   }
   return toResult(first, {
     attemptedResume: Boolean(resumeDecision.resumeSessionId),

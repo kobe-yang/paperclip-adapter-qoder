@@ -47,6 +47,10 @@ function asNumber(value) {
   return typeof value === "number" && isFinite(value) ? value : 0;
 }
 
+function asNonnegativeNumber(value) {
+  return typeof value === "number" && isFinite(value) && value >= 0 ? value : null;
+}
+
 function clip(text, max) {
   if (typeof text !== "string") return "";
   return text.length > max ? text.slice(0, max) + "\n… (truncated)" : text;
@@ -313,20 +317,63 @@ function parseResult(record, ts) {
   var errorCode = asString(record.error_code);
   if (errorCode) errors.push("error_code: " + errorCode);
 
-  var entries = [
-    {
+  var costUsd = asNonnegativeNumber(record.total_cost_usd);
+  var totalCredits = asNonnegativeNumber(record.total_credits);
+  var knownUsage = {};
+  var usageFields = [
+    ["input_tokens", "inputTokens"],
+    ["output_tokens", "outputTokens"],
+    ["cache_read_input_tokens", "cachedInputTokens"],
+    ["cache_creation_input_tokens", "cacheWriteTokens"],
+  ];
+  var consumedTokens = false;
+  for (var j = 0; j < usageFields.length; j += 1) {
+    var value = asNonnegativeNumber(usage[usageFields[j][0]]);
+    if (value !== null) {
+      knownUsage[usageFields[j][1]] = value;
+      if (value > 0) consumedTokens = true;
+    }
+  }
+  var consumedCredits = totalCredits !== null && totalCredits > 0;
+  var priced = costUsd !== null && (costUsd > 0 || (!consumedTokens && !consumedCredits));
+  var text = clip(asString(record.result), MAX_TEXT_CHARS);
+  var subtype = asString(record.subtype);
+  var isError = record.is_error === true;
+  var entries = [];
+  if (priced) {
+    entries.push({
       kind: "result",
       ts: ts,
-      text: clip(asString(record.result), MAX_TEXT_CHARS),
+      text: text,
       inputTokens: asNumber(usage.input_tokens),
       outputTokens: asNumber(usage.output_tokens),
       cachedTokens: asNumber(usage.cache_read_input_tokens),
-      costUsd: asNumber(record.total_cost_usd),
-      subtype: asString(record.subtype),
-      isError: record.is_error === true,
+      costUsd: costUsd,
+      subtype: subtype,
+      isError: isError,
       errors: errors,
-    },
-  ];
+    });
+  } else {
+    entries.push({
+      kind: "provider_activity",
+      ts: ts,
+      family: "terminal",
+      eventType: "result",
+      status: isError ? "failed" : "completed",
+      title: "Qoder result: USD cost unavailable" +
+        (consumedCredits ? " (" + totalCredits + " Qoder credits)" : ""),
+      summary: text,
+      payload: {
+        subtype: subtype,
+        isError: isError,
+        errors: errors,
+        usage: knownUsage,
+        totalCredits: totalCredits,
+        costUsd: null,
+        costStatus: "unpriced",
+      },
+    });
+  }
 
   // The CLI can exit 0 on a failed run, so the terminal reason is the only
   // place some stop causes (auth, budget, turn limit) are named.

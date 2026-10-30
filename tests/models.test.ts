@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { beforeEach, describe, expect, it } from "vitest";
+import type { AdapterModel } from "@paperclipai/adapter-utils/types";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearModelCache,
@@ -16,6 +17,16 @@ const REAL_OUTPUT = fs.readFileSync(path.join(fixturesDir, "list-models.txt"), "
 
 function ids(stdout: string): string[] {
   return parseModelList(stdout).map((model) => model.id);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("parseModelList — recorded output", () => {
@@ -133,6 +144,147 @@ describe("parseModelList — robustness", () => {
 describe("listModels caching", () => {
   beforeEach(() => {
     clearModelCache();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shares one pending probe between concurrent callers", async () => {
+    const pending = deferred<AdapterModel[]>();
+    const models = [{ id: "Auto", label: "Auto" }];
+    const probe = vi.fn(() => pending.promise);
+
+    const first = listModels(probe);
+    const second = listModels(probe);
+    pending.resolve(models);
+
+    const results = await Promise.all([first, second]);
+    expect(results).toEqual([models, models]);
+    expect(results[0]).toBe(results[1]);
+    expect(await listModels(probe)).toBe(models);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the refreshed cache when an older probe finishes last", async () => {
+    const oldPending = deferred<AdapterModel[]>();
+    const freshPending = deferred<AdapterModel[]>();
+    const oldModels = [{ id: "old", label: "old" }];
+    const freshModels = [{ id: "fresh", label: "fresh" }];
+    const probe = vi.fn()
+      .mockImplementationOnce(() => oldPending.promise)
+      .mockImplementationOnce(() => freshPending.promise);
+
+    const oldRequest = listModels(probe);
+    const refreshedRequest = refreshModels(probe);
+    expect(probe).toHaveBeenCalledTimes(2);
+
+    freshPending.resolve(freshModels);
+    await expect(refreshedRequest).resolves.toEqual(freshModels);
+    oldPending.resolve(oldModels);
+    await expect(oldRequest).resolves.toEqual(oldModels);
+
+    expect(await listModels(probe)).toEqual(freshModels);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not repopulate the cache after clearing a pending probe", async () => {
+    const pending = deferred<AdapterModel[]>();
+    const oldModels = [{ id: "old", label: "old" }];
+    const freshModels = [{ id: "fresh", label: "fresh" }];
+    const probe = vi.fn()
+      .mockImplementationOnce(() => pending.promise)
+      .mockResolvedValue(freshModels);
+
+    const oldRequest = listModels(probe);
+    clearModelCache();
+    pending.resolve(oldModels);
+    await expect(oldRequest).resolves.toEqual(oldModels);
+
+    expect(await listModels(probe)).toEqual(freshModels);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let an old completion clear a newer pending probe", async () => {
+    const oldPending = deferred<AdapterModel[]>();
+    const freshPending = deferred<AdapterModel[]>();
+    const oldModels = [{ id: "old", label: "old" }];
+    const freshModels = [{ id: "fresh", label: "fresh" }];
+    const probe = vi.fn()
+      .mockImplementationOnce(() => oldPending.promise)
+      .mockImplementation(() => freshPending.promise);
+
+    const oldRequest = listModels(probe);
+    const refreshedRequest = refreshModels(probe);
+    oldPending.resolve(oldModels);
+    await expect(oldRequest).resolves.toEqual(oldModels);
+
+    const joinedRequest = listModels(probe);
+    freshPending.resolve(freshModels);
+    await expect(Promise.all([refreshedRequest, joinedRequest]))
+      .resolves.toEqual([freshModels, freshModels]);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["empty", "rejected"] as const)(
+    "retries after a shared pending probe returns %s",
+    async (outcome) => {
+      const pending = deferred<AdapterModel[]>();
+      const models = [{ id: "Auto", label: "Auto" }];
+      const probe = vi.fn()
+        .mockImplementationOnce(() => pending.promise)
+        .mockImplementation(() => pending.promise);
+
+      const first = listModels(probe);
+      const second = listModels(probe);
+      if (outcome === "empty") pending.resolve([]);
+      else pending.reject(new Error("spawn qoder ENOENT"));
+      await expect(Promise.all([first, second])).resolves.toEqual([[], []]);
+
+      probe.mockResolvedValue(models);
+      expect(await listModels(probe)).toEqual(models);
+      expect(await listModels(probe)).toEqual(models);
+      expect(probe).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("retries after a synchronous probe exception", async () => {
+    const models = [{ id: "Auto", label: "Auto" }];
+    const probe = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error("spawn qoder ENOENT");
+      })
+      .mockResolvedValue(models);
+
+    await expect(listModels(probe)).resolves.toEqual([]);
+    expect(await listModels(probe)).toEqual(models);
+    expect(await listModels(probe)).toEqual(models);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("expires the cache exactly five minutes after the probe completes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const startedAt = new Date("2026-10-01T00:00:00Z").getTime();
+    vi.setSystemTime(startedAt);
+    const pending = deferred<AdapterModel[]>();
+    const models = [{ id: "Auto", label: "Auto" }];
+    const refreshedModels = [{ id: "Fast", label: "Fast" }];
+    const probe = vi.fn()
+      .mockImplementationOnce(() => pending.promise)
+      .mockResolvedValue(refreshedModels);
+
+    const request = listModels(probe);
+    const fetchedAt = startedAt + 60_000;
+    vi.setSystemTime(fetchedAt);
+    pending.resolve(models);
+    await expect(request).resolves.toEqual(models);
+
+    vi.setSystemTime(fetchedAt + 5 * 60 * 1000 - 1);
+    expect(await listModels(probe)).toEqual(models);
+    expect(probe).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(fetchedAt + 5 * 60 * 1000);
+    expect(await listModels(probe)).toEqual(refreshedModels);
+    expect(probe).toHaveBeenCalledTimes(2);
   });
 
   it("probes once and serves the cache afterwards", async () => {

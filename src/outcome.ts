@@ -47,6 +47,7 @@ export type OutcomeInput = {
   /** True when a stored session was refused or proved unusable. */
   clearSession: boolean;
   timeoutMessage: string;
+  cancelled?: boolean;
   /** Extra diagnostics for the workbench; must never contain credentials. */
   diagnostics?: Record<string, unknown>;
 };
@@ -128,8 +129,10 @@ export function resolveBillingType(state: AggregateState): AdapterBillingType {
 export function isSuccessfulAttempt(input: {
   state: AggregateState;
   proc: AttemptProcess;
+  cancelled?: boolean;
 }): boolean {
   const { state, proc } = input;
+  if (input.cancelled) return false;
   if (proc.timedOut) return false;
   if (proc.errorCode) return false;
   if (proc.exitCode !== null && proc.exitCode !== 0) return false;
@@ -157,7 +160,7 @@ export function buildExecutionResult(input: OutcomeInput): AdapterExecutionResul
   const usage = toUsageSummary(state);
   const { costUsd, costStatus } = resolveCost(state, usage);
   const model = state.model && state.model !== "<synthetic>" ? state.model : input.configuredModel;
-  const succeeded = isSuccessfulAttempt({ state, proc });
+  const succeeded = isSuccessfulAttempt(input);
   const stoppedAfterResult = wasStoppedAfterTerminalResult(proc);
 
   const resultJson: Record<string, unknown> = {
@@ -183,6 +186,9 @@ export function buildExecutionResult(input: OutcomeInput): AdapterExecutionResul
       ? { unmanagedBackgroundTask: proc.terminalResultCleanup }
       : {}),
     ...(input.diagnostics ?? {}),
+    ...(input.cancelled && proc.errorCode !== "qoder_provider_stop_unverified"
+      ? { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } }
+      : {}),
   };
 
   const base = {
@@ -198,7 +204,7 @@ export function buildExecutionResult(input: OutcomeInput): AdapterExecutionResul
     usageBasis: "per_run" as const,
     // The stream-json protocol has no post-exit usage receipt to reconcile
     // against, so collection closes with this run.
-    usageComplete: true,
+    usageComplete: proc.errorCode !== "qoder_provider_stop_unverified",
     provider: QODER_PROVIDER,
     biller: QODER_PROVIDER,
     model: model || null,
@@ -218,6 +224,26 @@ export function buildExecutionResult(input: OutcomeInput): AdapterExecutionResul
       timedOut: true,
       errorMessage: input.timeoutMessage,
       errorCode: "qoder_timeout",
+      summary: null,
+    };
+  }
+
+  if (proc.errorCode === "qoder_provider_stop_unverified") {
+    return {
+      ...base,
+      timedOut: false,
+      errorCode: proc.errorCode,
+      errorMessage: "Qoder provider termination could not be verified; stop collection was withheld.",
+      summary: null,
+    };
+  }
+
+  if (input.cancelled) {
+    return {
+      ...base,
+      timedOut: false,
+      errorCode: "qoder_cancelled",
+      errorMessage: "Qoder execution was cancelled by the run's operator cancellation signal.",
       summary: null,
     };
   }

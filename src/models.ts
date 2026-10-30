@@ -87,10 +87,14 @@ export function parseModelList(stdout: string): AdapterModel[] {
 
 type Cache = { models: AdapterModel[]; fetchedAt: number };
 let cache: Cache | null = null;
+let inflightPromise: Promise<AdapterModel[]> | null = null;
+let generation = 0;
 
 /** Exported for tests; also used by `refreshModels` to force a fresh probe. */
 export function clearModelCache(): void {
   cache = null;
+  generation += 1;
+  inflightPromise = null;
 }
 
 export type ModelProbe = () => Promise<AdapterModel[]>;
@@ -132,15 +136,25 @@ async function probeModels(): Promise<AdapterModel[]> {
  */
 export async function listModels(probe: ModelProbe = probeModels): Promise<AdapterModel[]> {
   if (cache && Date.now() - cache.fetchedAt < CACHE_TTL_MS) return cache.models;
-  try {
-    const models = await probe();
-    // Do not cache a failure: the usual cause is "not logged in yet", and the
-    // operator will log in and expect the list to appear.
-    if (models.length > 0) cache = { models, fetchedAt: Date.now() };
-    return models;
-  } catch {
-    return [];
-  }
+  if (inflightPromise) return inflightPromise;
+
+  const probeGeneration = generation;
+  inflightPromise = (async () => {
+    try {
+      const models = await probe();
+      // Do not cache a failure: the usual cause is "not logged in yet", and the
+      // operator will log in and expect the list to appear.
+      if (probeGeneration === generation && models.length > 0) {
+        cache = { models, fetchedAt: Date.now() };
+      }
+      return models;
+    } catch {
+      return [];
+    }
+  })().finally(() => {
+    if (probeGeneration === generation) inflightPromise = null;
+  });
+  return inflightPromise;
 }
 
 /** Explicit bypass for the UI's refresh control. */

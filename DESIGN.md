@@ -75,14 +75,14 @@ These are the differences that shaped the implementation.
    therefore aggregates incrementally in `onLog` and never reads the final
    buffer for state (`src/jsonl.ts`, `src/aggregate.ts`).
 
-5. **The host decodes each stdout chunk independently.** `runChildProcess` does
-   `const text = String(chunk)` per chunk, so a multi-byte UTF-8 character
-   landing on a chunk boundary becomes U+FFFD *before* any adapter sees it. The
-   bytes are gone and no adapter can recover them. Rather than hide this, the
-   adapter counts such lines separately (`decodeDamagedLines`), logs a warning,
-   and — if the terminal result was among the casualties — says the run "may
-   have succeeded; its outcome is unknown" instead of blaming the CLI's
-   protocol. **This is a known, unfixed limitation at the adapter layer.**
+5. **The stock helper decodes each chunk independently.** `runChildProcess`
+   uses `String(chunk)`, which loses UTF-8 bytes split across pipe events. Once
+   decoded, they cannot be recovered. The adapter captures its owned child
+   during the spawn callback and enables streaming UTF-8 decoding on both
+   pipes before their first data event. A byte-by-byte multilingual regression
+   and independently installed host run verify exact output without patching
+   the SDK. Damaged protocol lines are still counted and surfaced. The general
+   helper bug remains tracked upstream in #7479 / PR #13225.
 
 6. **Adapters cannot delete an inherited environment variable.** The host
    builds the child env as `{...sanitizeInheritedPaperclipEnv(process.env),
@@ -181,13 +181,18 @@ cause, `classifyFailure` returns `null` and the raw error summary is kept —
 no guessed code. Transport-level failures outrank anything the CLI "said",
 because if the CLI never started, nothing it printed is trustworthy.
 
-**Cancellation and timeouts** reuse the host's process management
-(`runAdapterExecutionTargetProcess` keyed by `runId`), which signals the whole
-process group — so a spawned descendant is reaped with its parent, and other
-Qoder processes on the machine are untouched. The adapter adds no signal
-handling of its own. A signal with no timeout and no terminal result is
-reported as `qoder_cancelled`; a signal *after* a terminal result keeps the
-answer, because that is the host's post-result cleanup.
+**Cancellation and timeouts** use the SDK for spawning but retain run-scoped
+ownership of the resulting POSIX process group. Independent npm installation
+creates a separate SDK process registry, so host registry lookup alone cannot
+stop the plugin's child. The adapter registers cancellation readiness and
+handles the host's AbortSignal, blocks pending stdin, sends TERM then KILL,
+and verifies group absence before collection or cancellation acknowledgement.
+The leader exiting does not prove its descendants stopped. An unverified stop
+is an explicit failure, with incomplete usage and no acknowledgement. Operator
+cancellation outranks a successful result while work still runs; post-result
+cleanup without cancellation preserves the answer. No global signal handler
+or cross-run process search is used. Windows descendant termination is not
+qualified because it lacks the owned POSIX-group contract.
 
 **Sessions.** The Qoder session id is persisted through Paperclip's own session
 contract (`sessionParams`), together with the working directory, workspace id

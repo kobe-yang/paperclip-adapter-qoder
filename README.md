@@ -6,7 +6,7 @@ agent execution runtime.
 - Adapter type: `qoder_local`
 - Verified against: Paperclip `2026.1023.0`, `@paperclipai/adapter-utils@2026.1023.0`, Qoder CLI `1.1.80` (stream-json wire protocol `1.5.0`), Node.js `24.22.1`
 - "Local" means the host where the Paperclip **server** runs, not the machine with the browser.
-- Release candidate: local execution has passed isolated acceptance, but Paperclip's external-parser worker has a confirmed host-side blocker (#16143 / PR #8806). Typed browser transcripts are not production-ready on the verified host build; see `ACCEPTANCE.md`.
+- Release candidate: local execution is verified. Typed transcripts passed conditional qualification in an isolated host copy with the Worker fix (#16143 / PR #8806); the unmodified verified host still has that blocker. No core fixes are shipped by this plugin. See `ACCEPTANCE.md` for the exact test conditions and remaining release limits.
 
 The adapter drives `qoder --print --input-format stream-json --output-format
 stream-json`, delivers the task prompt on stdin, parses the JSONL event stream
@@ -123,6 +123,15 @@ that might not exist.
 rejected — the run token is minted per run — and any `PAPERCLIP_*` variable the
 host already assigned wins over a configured one.
 
+### Usage and cost
+
+Credits consumption is reported as credits, not converted into an invented USD
+amount. A run with missing USD pricing, or with consumed credits/tokens and
+`total_cost_usd: 0`, is `unpriced`. Its browser transcript shows a terminal
+activity receipt with the known usage/credits instead of a misleading `$0`
+badge. Positive reported USD and genuine zero-consumption receipts retain the
+normal result display.
+
 ### Working-directory precedence
 
 1. `context.paperclipWorkspace.cwd` — the tree Paperclip staged for the run.
@@ -211,11 +220,12 @@ it is installed again.
 | Agent's replies show up as **your own** messages in a thread | The agent called the Paperclip API without an agent credential, so a `local_trusted` instance attributed it to the board user | Fixed in 0.1.0 by declaring `supportsLocalAgentJwt`; make sure `PAPERCLIP_AGENT_JWT_SECRET` is set on the instance (`paperclipai doctor` checks it) |
 | Working directory reported as your home directory | **Working directory** was left blank, so it fell back to the server process's cwd | Set an explicit absolute project path |
 | `qoder_protocol_violation`, "outcome is unknown" | CLI exited without a terminal `result` | Check the run log; reproduce with `scripts/qoder-smoke.sh` |
-| Same error mentioning "per-chunk UTF-8 decoding" | A multi-byte character landed on a stdout chunk boundary | Host-side limitation, see `DESIGN.md`; the run may have succeeded |
+| Same error mentioning "per-chunk UTF-8 decoding" | Damaged output arrived from an old/unverified runtime path | Rebuild the current adapter, which enables streaming UTF-8 on its owned pipes; inspect `DESIGN.md` and the run evidence rather than assuming success |
 | `terminal_reason: auth_payload_invalid`, no `system/init` | Paperclip was started from inside a Qoder session and the SDK handshake variables leaked in | The adapter neutralizes these automatically; reproduce the raw behaviour with `scripts/qoder-smoke.sh` |
 | Agent stalls on its first tool use | `permissionMode: default` in headless mode denies every prompt | Use `auto` |
 | `qoder_extra_args_invalid` | An unsupported, incomplete or adapter-managed option was supplied through `extraArgs` | Use a dedicated config field or one of the documented advanced options; arbitrary CLI/session/permission flags are not accepted |
 | `qoder_remote_unsupported` | The agent is assigned a remote execution environment | Assign local execution; this adapter runs the CLI on the Paperclip host only |
+| `qoder_provider_stop_unverified` | The owned process group could not be proven stopped | Inspect the recorded process/stop evidence; collection and cancellation acknowledgement are withheld. Windows descendant termination is not qualified. |
 
 ## Repeatable local entry points
 

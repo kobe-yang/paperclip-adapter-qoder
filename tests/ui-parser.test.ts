@@ -30,6 +30,12 @@ function loadParser(): ParseStdoutLine {
 
 const parse = loadParser();
 const TS = "2026-10-29T12:00:00.000Z";
+const ZERO_USAGE = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+};
 
 /**
  * Code with comments removed. The file's own header documents the sandbox it
@@ -218,6 +224,8 @@ describe("ui-parser — protocol lines", () => {
         subtype: "success",
         is_error: true,
         result: "Not logged in · Please run /login",
+        total_cost_usd: 0,
+        usage: ZERO_USAGE,
         terminal_reason: "auth_payload_invalid",
         errors: ["SDK auth payload file not found"],
         error_code: "auth_failed",
@@ -279,6 +287,116 @@ describe("ui-parser — protocol lines", () => {
   });
 });
 
+describe("ui-parser — USD pricing receipts", () => {
+  it.each([
+    { name: "observed credits with all-zero tokens", total_cost_usd: 0, total_credits: 3.931968, usage: ZERO_USAGE },
+    { name: "credits and tokens with zero USD", total_cost_usd: 0, total_credits: 3.931968, usage: { ...ZERO_USAGE, input_tokens: 10 } },
+    { name: "missing USD and usage" },
+    { name: "missing USD with explicit zero usage", usage: ZERO_USAGE },
+    { name: "input tokens with zero USD", total_cost_usd: 0, usage: { input_tokens: 10 } },
+    { name: "output tokens with zero USD", total_cost_usd: 0, usage: { output_tokens: 5 } },
+    { name: "cache reads with zero USD", total_cost_usd: 0, usage: { cache_read_input_tokens: 5 } },
+    { name: "cache writes with zero USD", total_cost_usd: 0, usage: { cache_creation_input_tokens: 5 } },
+  ])("avoids a free result badge: $name", ({ name: _name, ...fields }) => {
+    const entries = parse(JSON.stringify({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "completed work",
+      ...fields,
+    }), TS);
+    expect(kinds(entries)).toEqual(["provider_activity"]);
+    expect(entries[0]).toMatchObject({
+      ts: TS,
+      family: "terminal",
+      eventType: "result",
+      status: "completed",
+      summary: "completed work",
+      payload: { subtype: "success", isError: false, errors: [], costUsd: null, costStatus: "unpriced" },
+    });
+    expect(entries[0]?.title).toContain("USD cost unavailable");
+    if ("total_credits" in fields) {
+      expect(entries[0]?.title).toContain("Qoder credits");
+      expect(entries[0]?.title).toContain(String(fields.total_credits));
+      expect(entries[0]?.payload.totalCredits).toBe(fields.total_credits);
+    }
+    expect(entries[0]).not.toHaveProperty("costUsd");
+    expect(entries[0]).not.toHaveProperty("inputTokens");
+  });
+
+  it.each([null, -1, "0", "0.25"])("does not treat invalid USD %j as reported", (usd) => {
+    const [entry] = parse(JSON.stringify({ type: "result", total_cost_usd: usd, usage: ZERO_USAGE }), TS);
+    expect(entry?.kind).toBe("provider_activity");
+    expect(entry?.payload).toMatchObject({ costUsd: null, costStatus: "unpriced" });
+  });
+
+  it("does not treat a non-finite JSON number as reported USD", () => {
+    const [entry] = parse('{"type":"result","total_cost_usd":1e400}', TS);
+    expect(entry?.kind).toBe("provider_activity");
+    expect(entry?.payload.costUsd).toBeNull();
+  });
+
+  it("preserves only known usage without inventing zero counters", () => {
+    const [entry] = parse(JSON.stringify({
+      type: "result",
+      usage: { input_tokens: 10, output_tokens: "5", cache_read_input_tokens: 7, cache_creation_input_tokens: 3 },
+    }), TS);
+    expect(entry?.payload.usage).toEqual({ inputTokens: 10, cachedInputTokens: 7, cacheWriteTokens: 3 });
+    expect(entry?.payload.totalCredits).toBeNull();
+    const [missing] = parse(JSON.stringify({ type: "result" }), TS);
+    expect(missing?.payload.usage).toEqual({});
+  });
+
+  it("keeps positive USD as a result even when credits are also reported", () => {
+    const entries = parse(JSON.stringify({
+      type: "result", subtype: "success", is_error: false, result: "done",
+      total_cost_usd: 0.25, total_credits: 3.931968,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 7 },
+    }), TS);
+    expect(entries).toEqual([{
+      kind: "result", ts: TS, text: "done", inputTokens: 10, outputTokens: 5,
+      cachedTokens: 7, costUsd: 0.25, subtype: "success", isError: false, errors: [],
+    }]);
+  });
+
+  it.each([
+    { usage: ZERO_USAGE, total_credits: 0 },
+    { usage: ZERO_USAGE },
+    {},
+  ])("keeps explicit zero USD with no consumption as a numeric result: %j", (fields) => {
+    const entries = parse(JSON.stringify({ type: "result", total_cost_usd: 0, ...fields }), TS);
+    expect(kinds(entries)).toEqual(["result"]);
+    expect(entries[0]).toMatchObject({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: 0 });
+  });
+
+  it("preserves unpriced failure errors and the terminal reason", () => {
+    const entries = parse(JSON.stringify({
+      type: "result", subtype: "error_during_execution", is_error: true,
+      result: "Request failed", total_cost_usd: 0, total_credits: 3.931968,
+      terminal_reason: "auth_payload_invalid",
+      errors: [" SDK auth payload file not found ", "", 7], error_code: "auth_failed",
+    }), TS);
+    expect(kinds(entries)).toEqual(["provider_activity", "system"]);
+    expect(entries[0]).toMatchObject({
+      family: "terminal", eventType: "result", status: "failed", summary: "Request failed",
+      payload: {
+        subtype: "error_during_execution", isError: true,
+        errors: ["SDK auth payload file not found", "error_code: auth_failed"],
+        costUsd: null, costStatus: "unpriced", totalCredits: 3.931968, usage: {},
+      },
+    });
+    expect(entries[0]?.title).toContain("USD cost unavailable");
+    expect(entries[0]?.title).toContain("Qoder credits");
+    expect(entries[1]).toEqual({ kind: "system", ts: TS, text: "Qoder stopped: auth_payload_invalid" });
+  });
+
+  it("clips the unpriced receipt summary", () => {
+    const [entry] = parse(JSON.stringify({ type: "result", result: "x".repeat(100_000) }), TS);
+    expect(entry?.summary.length).toBeLessThan(21_000);
+    expect(entry?.summary).toContain("truncated");
+  });
+});
+
 describe("ui-parser — robustness", () => {
   it("drops blank lines", () => {
     expect(parse("", TS)).toEqual([]);
@@ -323,7 +441,9 @@ describe("ui-parser — robustness", () => {
       parse(JSON.stringify({ type: "assistant", message: { content: "plain string" } }), TS),
     ).not.toThrow();
     expect(() => parse(JSON.stringify({ type: "result", usage: "nope" }), TS)).not.toThrow();
-    expect(parse(JSON.stringify({ type: "result", usage: "nope" }), TS)[0]?.inputTokens).toBe(0);
+    expect(parse(JSON.stringify({ type: "result", usage: "nope" }), TS)[0]).toMatchObject({
+      kind: "provider_activity", payload: { usage: {}, costUsd: null, costStatus: "unpriced" },
+    });
   });
 
   it("clips very long text so one line cannot flood the transcript", () => {

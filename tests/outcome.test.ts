@@ -230,6 +230,48 @@ describe("buildExecutionResult", () => {
     expect(result.summary).toBeNull();
   });
 
+  it.each([null, { kind: "terminal_result_cleanup", stopped: true }])(
+    "explicit cancellation outranks a successful terminal result and cleanup %j without losing evidence",
+    (terminalResultCleanup) => {
+      const result = build(stateWith({
+        ...okResult,
+        totalCostUsd: 0.25,
+        totalCredits: 2,
+        usage: { inputTokens: 120, outputTokens: 18, cachedInputTokens: 400, cacheWriteTokens: 10 },
+      }), { ...cleanExit, terminalResultCleanup }, {
+        cancelled: true,
+        resolvedSessionId: "cancelled-session",
+        sessionParams: { sessionId: "cancelled-session" },
+      });
+      expect(result.errorCode).toBe("qoder_cancelled");
+      expect(result.signal).toBeNull();
+      expect(result.costUsd).toBe(0.25);
+      expect(result.usage?.inputTokens).toBe(130);
+      expect(result.sessionId).toBe("cancelled-session");
+      expect((result.resultJson as any).qoder.totalCredits).toBe(2);
+      expect((result.resultJson as any).unmanagedBackgroundTask).toEqual(terminalResultCleanup ?? undefined);
+      expect(result.resultJson).toMatchObject({ executionCancellation: { state: "acknowledged" } });
+      expect(Number.isFinite(Date.parse((result.resultJson as any).executionCancellation.acknowledgedAt))).toBe(true);
+    },
+  );
+
+  it("keeps timeout priority over explicit cancellation", () => {
+    const result = build(stateWith(okResult), { ...cleanExit, timedOut: true }, { cancelled: true });
+    expect(result.errorCode).toBe("qoder_timeout");
+  });
+
+  it.each([false, true])("never claims complete usage or verified stop on an unverified provider (timeout=%s)", (timedOut) => {
+    const result = build(stateWith({ ...okResult, totalCostUsd: 0.25 }), {
+      ...cleanExit,
+      timedOut,
+      errorCode: "qoder_provider_stop_unverified",
+    }, { cancelled: true });
+    expect(result.errorCode).toBe(timedOut ? "qoder_timeout" : "qoder_provider_stop_unverified");
+    expect(result.usageComplete).toBe(false);
+    expect(result.costUsd).toBe(0.25);
+    expect(result.resultJson?.executionCancellation).toBeUndefined();
+  });
+
   it("keeps the CLI's answer when it is stopped after reporting a result", () => {
     // The post-result cleanup signal must not turn a finished run into a
     // cancellation or a failure.
